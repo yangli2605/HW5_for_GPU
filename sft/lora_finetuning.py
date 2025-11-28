@@ -1,6 +1,7 @@
 """
-步骤 2: LoRA 微调 (使用 peft 和 trl)
-预计时间: 30分钟 - 1小时
+步骤 3: 全量微调 (Full Fine-Tuning)
+预计时间: 2+ 小时
+注意: 全量微调需要更多的 GPU 内存和时间
 """
 import torch
 from datasets import load_from_disk
@@ -8,57 +9,74 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainingArguments,
-    BitsAndBytesConfig
+    Trainer,
+    DataCollatorForLanguageModeling
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from trl import SFTTrainer
 import os
 from datetime import datetime
 
+def tokenize_function(examples, tokenizer, max_length=512):
+    """Tokenize 函数"""
+    # Tokenize 文本
+    result = tokenizer(
+        examples['text'],
+        truncation=True,
+        max_length=max_length,
+        padding='max_length',
+        return_tensors=None
+    )
+    
+    # 设置 labels (用于计算 loss)
+    result["labels"] = result["input_ids"].copy()
+    
+    return result
+
 def main():
     print("=" * 60)
-    print("步骤 2: LoRA 微调")
+    print("步骤 3: 全量微调 (Full Fine-Tuning)")
     print("=" * 60)
     
     # ============= 配置参数 =============
     
     # 模型配置
-    MODEL_NAME = "microsoft/phi-2"  # 使用较小的模型以加快训练速度
-    # 其他选择:
-    # "meta-llama/Llama-2-7b-hf"
-    # "mistralai/Mistral-7B-v0.1"
-    # "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
-    
-    # LoRA 配置
-    LORA_R = 16  # LoRA 秩
-    LORA_ALPHA = 32  # LoRA alpha 参数
-    LORA_DROPOUT = 0.05
+    MODEL_NAME = "microsoft/phi-2"  # 使用较小的模型
+    # 注意: 全量微调对于大模型 (7B+) 需要大量显存
+    # 可选择: "TinyLlama/TinyLlama-1.1B-Chat-v1.0" (更小更快)
     
     # 训练配置
-    OUTPUT_DIR = "./outputs/lora_model"
+    OUTPUT_DIR = "./outputs/full_model"
     NUM_EPOCHS = 3
-    BATCH_SIZE = 4
-    GRADIENT_ACCUMULATION_STEPS = 4
-    LEARNING_RATE = 2e-4
+    BATCH_SIZE = 2  # 全量微调需要更多内存，减小批大小
+    GRADIENT_ACCUMULATION_STEPS = 8  # 增加梯度累积以补偿小批大小
+    LEARNING_RATE = 5e-5  # 全量微调使用更小的学习率
     MAX_SEQ_LENGTH = 512
+    WEIGHT_DECAY = 0.01
     
-    # 是否使用量化 (4-bit)
-    USE_4BIT = True
+    # 是否使用 DeepSpeed (需要配置文件)
+    USE_DEEPSPEED = False
     
     print(f"\n配置:")
     print(f"  模型: {MODEL_NAME}")
-    print(f"  LoRA 秩: {LORA_R}")
     print(f"  训练轮数: {NUM_EPOCHS}")
     print(f"  批大小: {BATCH_SIZE}")
     print(f"  梯度累积步数: {GRADIENT_ACCUMULATION_STEPS}")
+    print(f"  有效批大小: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
     print(f"  学习率: {LEARNING_RATE}")
     print(f"  最大序列长度: {MAX_SEQ_LENGTH}")
-    print(f"  使用 4-bit 量化: {USE_4BIT}")
+    print(f"  使用 DeepSpeed: {USE_DEEPSPEED}")
     
     # ============= 1. 加载数据集 =============
     print("\n1. 加载数据集...")
     train_dataset = load_from_disk("./data/train")
     eval_dataset = load_from_disk("./data/eval")
+    
+    # 可选: 使用数据子集以加快训练 (用于测试)
+    USE_SUBSET = False
+    if USE_SUBSET:
+        train_dataset = train_dataset.select(range(1000))
+        eval_dataset = eval_dataset.select(range(100))
+        print(f"  [使用数据子集进行测试]")
+    
     print(f"✓ 训练集: {len(train_dataset)} 样本")
     print(f"✓ 验证集: {len(eval_dataset)} 样本")
     
@@ -73,75 +91,56 @@ def main():
     
     print(f"✓ Tokenizer 加载完成")
     print(f"  词汇表大小: {len(tokenizer)}")
-    print(f"  PAD token: {tokenizer.pad_token}")
     
-    # ============= 3. 配置量化 =============
-    if USE_4BIT:
-        print("\n3. 配置 4-bit 量化...")
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        print("✓ 量化配置完成")
-    else:
-        bnb_config = None
-        print("\n3. 不使用量化")
+    # ============= 3. Tokenize 数据集 =============
+    print("\n3. Tokenizing 数据集...")
+    print("  这可能需要几分钟...")
+    
+    # Tokenize
+    tokenized_train = train_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, MAX_SEQ_LENGTH),
+        batched=True,
+        remove_columns=train_dataset.column_names,
+        desc="Tokenizing train dataset"
+    )
+    
+    tokenized_eval = eval_dataset.map(
+        lambda x: tokenize_function(x, tokenizer, MAX_SEQ_LENGTH),
+        batched=True,
+        remove_columns=eval_dataset.column_names,
+        desc="Tokenizing eval dataset"
+    )
+    
+    print(f"✓ Tokenization 完成")
+    print(f"  训练样本: {len(tokenized_train)}")
+    print(f"  验证样本: {len(tokenized_eval)}")
     
     # ============= 4. 加载模型 =============
     print("\n4. 加载基础模型...")
+    print("  注意: 全量微调将更新所有参数")
+    
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        quantization_config=bnb_config if USE_4BIT else None,
+        torch_dtype=torch.float16,
         device_map="auto",
         trust_remote_code=True,
-        torch_dtype=torch.float16 if not USE_4BIT else None,
     )
     
-    # 如果使用量化，准备模型
-    if USE_4BIT:
-        model = prepare_model_for_kbit_training(model)
+    # 启用梯度检查点以节省内存
+    model.gradient_checkpointing_enable()
     
     print(f"✓ 模型加载完成")
     
-    # 打印模型参数量
+    # 计算参数量
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"  总参数量: {total_params:,}")
-    
-    # ============= 5. 配置 LoRA =============
-    print("\n5. 配置 LoRA...")
-    
-    # 自动检测目标模块
-    # 对于不同的模型架构，目标模块名称可能不同
-    target_modules = ["q_proj", "v_proj"]  # 默认值
-    
-    # 根据模型类型调整
-    if "phi" in MODEL_NAME.lower():
-        target_modules = ["q_proj", "k_proj", "v_proj", "dense"]
-    elif "llama" in MODEL_NAME.lower():
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
-    
-    lora_config = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        target_modules=target_modules,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
-    
-    model = get_peft_model(model, lora_config)
-    
-    # 打印可训练参数
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"✓ LoRA 配置完成")
-    print(f"  目标模块: {target_modules}")
+    
+    print(f"  总参数量: {total_params:,}")
     print(f"  可训练参数: {trainable_params:,}")
     print(f"  可训练参数比例: {100 * trainable_params / total_params:.2f}%")
     
-    # ============= 6. 配置训练参数 =============
-    print("\n6. 配置训练参数...")
+    # ============= 5. 配置训练参数 =============
+    print("\n5. 配置训练参数...")
     
     # 创建输出目录
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -153,114 +152,57 @@ def main():
         per_device_eval_batch_size=BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         learning_rate=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
         lr_scheduler_type="cosine",
-        warmup_steps=100,
+        warmup_ratio=0.05,
         logging_steps=10,
         save_strategy="epoch",
-        eval_strategy="epoch",  # 修改: 使用 eval_strategy 代替 evaluation_strategy
+        eval_strategy="epoch",  # 使用 eval_strategy 而不是 evaluation_strategy
         fp16=True,
-        optim="paged_adamw_8bit" if USE_4BIT else "adamw_torch",
+        optim="adamw_torch",
+        gradient_checkpointing=True,
         report_to="tensorboard",
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        # DeepSpeed 配置 (如果使用)
+        deepspeed="./configs/ds_config.json" if USE_DEEPSPEED else None,
     )
     
     print(f"✓ 训练参数配置完成")
-    print(f"  有效批大小: {BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS}")
-    print(f"  总训练步数: ~{len(train_dataset) * NUM_EPOCHS // (BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)}")
+    total_steps = len(tokenized_train) * NUM_EPOCHS // (BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS)
+    print(f"  预计总训练步数: {total_steps}")
+    
+    # ============= 6. 创建 Data Collator =============
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # 因果语言模型，不使用 MLM
+    )
     
     # ============= 7. 创建 Trainer =============
-    print("\n7. 创建 SFT Trainer...")
+    print("\n7. 创建 Trainer...")
     
-    # 格式化函数
-    def formatting_func(example):
-        return example['text']
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_eval,
+        data_collator=data_collator,
+    )
     
-    # 尝试不同的参数组合以兼容不同版本的 TRL
-    try:
-        # 首先尝试新版本参数
-        trainer = SFTTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            dataset_text_field="text",  # 直接指定文本字段
-            tokenizer=tokenizer,
-            packing=False,
-        )
-        print("✓ Trainer 创建完成 (使用 dataset_text_field)")
-    except TypeError as e:
-        print(f"尝试备选参数...")
-        # 如果失败，尝试使用 formatting_func
-        try:
-            trainer = SFTTrainer(
-                model=model,
-                args=training_args,
-                train_dataset=train_dataset,
-                eval_dataset=eval_dataset,
-                formatting_func=formatting_func,
-                tokenizer=tokenizer,
-            )
-            print("✓ Trainer 创建完成 (使用 formatting_func)")
-        except TypeError as e2:
-            print(f"✗ 创建失败: {e2}")
-            print("\n尝试使用标准 Trainer 而不是 SFTTrainer...")
-            
-            # 最后的备选方案：使用标准 Trainer
-            from transformers import Trainer, DataCollatorForLanguageModeling
-            
-            # Tokenize 数据集
-            def tokenize_function(examples):
-                return tokenizer(
-                    examples['text'],
-                    truncation=True,
-                    max_length=MAX_SEQ_LENGTH,
-                    padding='max_length'
-                )
-            
-            tokenized_train = train_dataset.map(
-                tokenize_function,
-                batched=True,
-                remove_columns=train_dataset.column_names
-            )
-            
-            tokenized_eval = eval_dataset.map(
-                tokenize_function,
-                batched=True,
-                remove_columns=eval_dataset.column_names
-            )
-            
-            # 设置 labels
-            tokenized_train = tokenized_train.map(
-                lambda x: {"labels": x["input_ids"]},
-                batched=True
-            )
-            tokenized_eval = tokenized_eval.map(
-                lambda x: {"labels": x["input_ids"]},
-                batched=True
-            )
-            
-            data_collator = DataCollatorForLanguageModeling(
-                tokenizer=tokenizer,
-                mlm=False
-            )
-            
-            trainer = Trainer(
-                model=model,
-                args=training_args,
-                train_dataset=tokenized_train,
-                eval_dataset=tokenized_eval,
-                data_collator=data_collator,
-            )
-            print("✓ Trainer 创建完成 (使用标准 Trainer)")
+    print("✓ Trainer 创建完成")
     
-    print("✓ Trainer 已准备就绪")
+    # ============= 8. 评估初始性能 =============
+    print("\n8. 评估初始性能...")
+    initial_eval = trainer.evaluate()
+    print(f"✓ 初始验证损失: {initial_eval['eval_loss']:.4f}")
     
-    # ============= 8. 开始训练 =============
-    print("\n8. 开始训练...")
+    # ============= 9. 开始训练 =============
+    print("\n9. 开始全量微调...")
     print("=" * 60)
     print(f"训练开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("⚠️  全量微调通常需要 2+ 小时，请耐心等待...")
     print("=" * 60)
     
     # 训练
@@ -270,14 +212,14 @@ def main():
     print(f"训练结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
     
-    # ============= 9. 保存模型 =============
-    print("\n9. 保存模型...")
+    # ============= 10. 保存模型 =============
+    print("\n10. 保存模型...")
     
-    # 保存 LoRA 适配器
-    model.save_pretrained(f"{OUTPUT_DIR}/final_lora_adapter")
-    tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_lora_adapter")
+    # 保存完整模型
+    model.save_pretrained(f"{OUTPUT_DIR}/final_model")
+    tokenizer.save_pretrained(f"{OUTPUT_DIR}/final_model")
     
-    print(f"✓ LoRA 适配器已保存到: {OUTPUT_DIR}/final_lora_adapter")
+    print(f"✓ 完整模型已保存到: {OUTPUT_DIR}/final_model")
     
     # 保存训练日志
     import json
@@ -286,26 +228,39 @@ def main():
         json.dump(log_history, f, indent=2)
     print(f"✓ 训练日志已保存到: {OUTPUT_DIR}/training_log.json")
     
-    # ============= 10. 显示最终指标 =============
-    print("\n10. 训练总结:")
-    print("-" * 60)
-    
-    # 获取最终指标
+    # ============= 11. 最终评估 =============
+    print("\n11. 最终评估...")
     final_eval = trainer.evaluate()
-    print(f"最终验证损失: {final_eval['eval_loss']:.4f}")
     
-    # 从日志中提取训练损失趋势
+    print("\n训练总结:")
+    print("-" * 60)
+    print(f"初始验证损失: {initial_eval['eval_loss']:.4f}")
+    print(f"最终验证损失: {final_eval['eval_loss']:.4f}")
+    print(f"损失降低: {initial_eval['eval_loss'] - final_eval['eval_loss']:.4f}")
+    
+    # 从日志中提取训练损失
     train_losses = [log['loss'] for log in log_history if 'loss' in log]
     if train_losses:
-        print(f"初始训练损失: {train_losses[0]:.4f}")
-        print(f"最终训练损失: {train_losses[-1]:.4f}")
-        print(f"损失降低: {train_losses[0] - train_losses[-1]:.4f}")
+        print(f"\n训练损失:")
+        print(f"  初始: {train_losses[0]:.4f}")
+        print(f"  最终: {train_losses[-1]:.4f}")
+        print(f"  降低: {train_losses[0] - train_losses[-1]:.4f}")
+    
+    # 检查过拟合
+    if len(train_losses) > 0:
+        overfitting_gap = train_losses[-1] - final_eval['eval_loss']
+        print(f"\n过拟合检查:")
+        print(f"  训练-验证损失差距: {overfitting_gap:.4f}")
+        if overfitting_gap < -0.5:
+            print(f"  ⚠️  可能存在过拟合 (验证损失 > 训练损失)")
+        else:
+            print(f"  ✓ 没有明显过拟合")
     
     print("\n" + "=" * 60)
-    print("✓ 步骤 2 完成！LoRA 微调完成。")
+    print("✓ 步骤 3 完成！全量微调完成。")
     print("=" * 60)
-    print(f"\n模型保存在: {OUTPUT_DIR}/final_lora_adapter")
-    print("下一步: 运行 3_full_finetuning.py 进行全量微调")
+    print(f"\n模型保存在: {OUTPUT_DIR}/final_model")
+    print("下一步: 运行 4_evaluate_compare.py 进行评估和对比")
 
 if __name__ == "__main__":
     main()
